@@ -108,11 +108,6 @@ Paste the text above into the netlist editor and click **Generate Diagram** to s
 4. Toggle grid/snap for tidy alignment.
 5. Export as SVG or PNG for insertion into documentation.
 
-## Next steps you might ask for
-
-* Produce a `README.md` file ready for download.
-* Generate a compact quick-start cheat sheet.
-* Add additional symbol types or support for common SPICE directives.
 
 ---
 
