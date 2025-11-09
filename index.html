@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>SPICE Netlist Generator & Improved Planar Renderer</title>
+<style>
+  :root{--bg:#ffffff;--fg:#000000;--muted:#333}
+  html,body{height:100%;margin:0;font-family:Inter,Arial,Helvetica,sans-serif;background:var(--bg);color:var(--fg)}
+  .app{display:grid;grid-template-columns:360px 1fr 420px;gap:12px;height:100vh;padding:12px;box-sizing:border-box}
+  .panel{border:2px solid var(--fg);padding:10px;box-sizing:border-box;background:#fff}
+  h2{margin:6px 0 10px;font-size:16px}
+  .controls{display:flex;gap:8px;flex-wrap:wrap}
+  .controls button{padding:8px;border:1px solid var(--fg);background:#fff;cursor:pointer}
+  textarea{width:100%;height:200px;border:1px solid var(--muted);padding:8px;box-sizing:border-box;font-family:monospace}
+  label{font-size:13px}
+  input[type=text], select{width:100%;padding:6px;border:1px solid var(--muted);box-sizing:border-box}
+  svg{width:100%;height:100%;display:block;cursor:grab}
+  .canvas-wrap{background:#fff;border:1px solid var(--fg);height:calc(100vh - 64px);overflow:hidden;position:relative}
+  .footer{font-size:12px;color:var(--muted);margin-top:8px}
+  .toolbar{display:flex;gap:6px;margin-bottom:8px}
+  .node-label{font:12px monospace;}
+  .status{font-size:12px;color:var(--muted);margin-top:6px}
+  .muted{color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Left: Palette & Netlist Editor -->
+  <div class="panel">
+    <h2>SPICE Netlist</h2>
+    <textarea id="netlist" spellcheck="false" placeholder="Paste SPICE-style netlist here...\nExample:\nV1 n001 0 DC 5\nR1 n001 n002 1k\nC1 n002 0 10uF"></textarea>
+
+    <div class="controls">
+      <button id="gen-netlist">Generate Diagram</button>
+      <button id="auto-layout">Auto-layout</button>
+      <button id="export-svg">Export SVG</button>
+      <button id="export-png">Export PNG</button>
+      <button id="copy-net">Copy Netlist</button>
+    </div>
+
+    <h2 style="margin-top:10px">Options / Tools</h2>
+    <div class="controls">
+      <button id="zoom-in">Zoom +</button>
+      <button id="zoom-out">Zoom -</button>
+      <button id="fit-view">Fit</button>
+      <button id="toggle-grid">Toggle Grid</button>
+      <button id="toggle-snap">Toggle Snap</button>
+      <button id="highlight-floats">Highlight Floating Nets</button>
+    </div>
+
+    <div class="status" id="status">Status: ready</div>
+    <div class="footer">Improvements: connections now snap to node coordinates and draw connector lines so components always visually connect to node dots. Use mouse wheel to zoom, middle-drag to pan, click-and-drag node labels to reposition nets.</div>
+  </div>
+
+  <!-- Center: SVG canvas -->
+  <div class="panel canvas-wrap">
+    <h2>Black & White Circuit Diagram (Planar)</h2>
+    <div style="height:calc(100% - 36px);position:relative">
+      <svg id="svgcanvas" viewBox="0 0 1200 800" preserveAspectRatio="xMidYMid meet">
+        <defs>
+          <style>.grid-line{stroke:#eee;stroke-width:1}</style>
+        </defs>
+        <g id="viewport">
+          <g id="grid"></g>
+          <g id="wires"></g>
+          <g id="comps"></g>
+          <g id="nodes"></g>
+          <g id="overlays"></g>
+        </g>
+      </svg>
+    </div>
+  </div>
+
+  <!-- Right: Component List & Inspector -->
+  <div class="panel">
+    <h2>Parsed Components / Nets</h2>
+    <div id="list" style="height:46%;overflow:auto;border:1px solid var(--muted);padding:6px"></div>
+    <h2 style="margin-top:8px">Nets</h2>
+    <div id="netlistview" style="height:36%;overflow:auto;border:1px dashed var(--muted);padding:6px"></div>
+    <div style="margin-top:8px" class="footer">Drag node labels on the canvas to adjust layout. Floating nets are highlighted when requested.</div>
+  </div>
+</div>
+
+<script>
+// Improved SPICE->diagram with exact connectors + zoom/pan + extra tools
+let components = []; // parsed from netlist
+let graph = {nodes:{}, edges:[]};
+let snap = true; let gridOn = true;
+let scale = 1, panX = 0, panY = 0;
+const svg = document.getElementById('svgcanvas');
+const viewport = document.getElementById('viewport');
+const wiresGroup = document.getElementById('wires');
+const compsGroup = document.getElementById('comps');
+const nodesGroup = document.getElementById('nodes');
+const overlaysGroup = document.getElementById('overlays');
+const gridGroup = document.getElementById('grid');
+
+function setStatus(s){ document.getElementById('status').textContent = 'Status: ' + s; }
+
+// --- grid ---
+function drawGrid(){ gridGroup.innerHTML=''; if(!gridOn) return; const step = 24; for(let x=0;x<=1200;x+=step){ const l=document.createElementNS('http://www.w3.org/2000/svg','line'); l.setAttribute('x1',x); l.setAttribute('y1',0); l.setAttribute('x2',x); l.setAttribute('y2',800); l.setAttribute('class','grid-line'); gridGroup.appendChild(l);} for(let y=0;y<=800;y+=step){ const l=document.createElementNS('http://www.w3.org/2000/svg','line'); l.setAttribute('x1',0); l.setAttribute('y1',y); l.setAttribute('x2',1200); l.setAttribute('y2',y); l.setAttribute('class','grid-line'); gridGroup.appendChild(l);} }
+
+drawGrid();
+
+function snapTo(v){ if(!snap) return v; return Math.round(v/24)*24; }
+
+// --- parsing ---
+function parseNetlist(text){ components = []; const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l && !l.startsWith('*') && !l.startsWith(';'));
+  lines.forEach(l=>{ const t = l.split(/\s+/); const name = t[0]; const type = name[0].toUpperCase(); if(['R','C','L','D','V','I'].includes(type)){ const n1=t[1]||'n001', n2=t[2]||'0', val=t.slice(3).join(' '); components.push({id:name,type:type,nodes:[n1,n2],value:val}); }
+    else if(type==='Q'){ const n1=t[1]||'n1', n2=t[2]||'n2', n3=t[3]||'n3', val=t.slice(4).join(' '); components.push({id:name,type:'Q',nodes:[n1,n2,n3],value:val}); }
+    else if(type==='M'){ const nodesList=[t[1]||'nd',t[2]||'ng',t[3]||'ns',t[4]||'nb']; const val=t.slice(5).join(' '); components.push({id:name,type:'M',nodes:nodesList,value:val}); }
+    else if(type==='U'){ const nodesList=t.slice(1,5).filter(Boolean); const val=t.slice(5).join(' '); components.push({id:name,type:'U',nodes:nodesList,value:val}); }
+    else if(name.toUpperCase()==='GND' || type==='G'){ components.push({id:name,type:'GND',nodes:['0'],value:''}); }
+    else { const n1=t[1]||'n001', n2=t[2]||'0', val=t.slice(3).join(' '); components.push({id:name,type:type,nodes:[n1,n2],value:val}); }
+  });
+  setStatus('Parsed ' + components.length + ' components');
+}
+
+// --- build graph (nodes map and edges) ---
+function buildGraph(){ graph = {nodes:{}, edges:[]}; components.forEach(c=>{ c.nodes.forEach(n=>{ const k = (''+n).toLowerCase(); if(!graph.nodes[k]) graph.nodes[k] = {name:n, x:300 + Math.random()*600, y:120 + Math.random()*420, refs:[]}; graph.nodes[k].refs.push(c.id); }); for(let i=0;i<c.nodes.length-1;i++){ graph.edges.push({a:c.nodes[i].toLowerCase(), b:c.nodes[i+1].toLowerCase(), comp:c}); } }); }
+
+// --- layout (spring) ---
+function layoutGraph(iters=300){ const nodes = graph.nodes; const edges = graph.edges; const keys = Object.keys(nodes); const ks=0.1, rep=8000; for(let it=0; it<iters; it++){ const f = {}; keys.forEach(k=>f[k]={x:0,y:0}); for(let i=0;i<keys.length;i++){ for(let j=i+1;j<keys.length;j++){ const a=nodes[keys[i]], b=nodes[keys[j]]; let dx=a.x-b.x, dy=a.y-b.y; let d2=dx*dx+dy*dy+1e-6; let force=rep/d2; let d=Math.sqrt(d2); dx/=d; dy/=d; f[a.name.toLowerCase()].x += dx*force; f[a.name.toLowerCase()].y += dy*force; f[b.name.toLowerCase()].x -= dx*force; f[b.name.toLowerCase()].y -= dy*force; } } edges.forEach(e=>{ const a=nodes[e.a], b=nodes[e.b]; if(!a||!b) return; let dx=b.x-a.x, dy=b.y-a.y; let d=Math.sqrt(dx*dx+dy*dy)+1e-6; const desired=140; const fr=ks*(d-desired); dx/=d; dy/=d; f[a.name.toLowerCase()].x += dx*fr; f[a.name.toLowerCase()].y += dy*fr; f[b.name.toLowerCase()].x -= dx*fr; f[b.name.toLowerCase()].y -= dy*fr; }); keys.forEach(k=>{ nodes[k].x += Math.max(-8,Math.min(8,f[k].x)); nodes[k].y += Math.max(-8,Math.min(8,f[k].y)); nodes[k].x = Math.max(30,Math.min(1170,nodes[k].x)); nodes[k].y = Math.max(30,Math.min(770,nodes[k].y)); }); } }
+
+// --- rendering helpers ---
+function worldPoint(x,y){ return {x: x*scale + panX, y: y*scale + panY}; }
+function screenToWorld(clientX,clientY){ const r = svg.getBoundingClientRect(); const x = (clientX - r.left) * (1200/r.width); const y = (clientY - r.top) * (800/r.height); return {x:(x - panX)/scale, y:(y - panY)/scale}; }
+
+function clearGroups(){ wiresGroup.innerHTML=''; compsGroup.innerHTML=''; nodesGroup.innerHTML=''; overlaysGroup.innerHTML=''; }
+
+// computes component endpoint world coords given comp mid, angle and endpoint offset
+function compEndpoints(mx,my,angle,halfLen=40){ const cos = Math.cos(angle), sin = Math.sin(angle); const ex1 = mx + ( -halfLen * cos ); const ey1 = my + ( -halfLen * sin ); const ex2 = mx + ( halfLen * cos ); const ey2 = my + ( halfLen * sin ); return [{x:ex1,y:ey1},{x:ex2,y:ey2}]; }
+
+function render(){ clearGroups(); drawGrid(); // wires
+  // draw wires between node centers
+  Object.values(graph.edges).forEach(e=>{}); // ensure edges exist
+  graph.edges.forEach(e=>{ const a = graph.nodes[e.a], b = graph.nodes[e.b]; if(!a||!b) return; const line = document.createElementNS('http://www.w3.org/2000/svg','line'); line.setAttribute('x1',a.x); line.setAttribute('y1',a.y); line.setAttribute('x2',b.x); line.setAttribute('y2',b.y); line.setAttribute('stroke','black'); line.setAttribute('stroke-width','2'); wiresGroup.appendChild(line); });
+
+  // draw components at midpoints, but also draw connector lines to node centers for perfect connection
+  components.forEach(c=>{
+    if(!c.nodes || c.nodes.length===0) return;
+    const a = graph.nodes[c.nodes[0].toLowerCase()];
+    let b = null;
+    if(c.nodes.length>=2) b = graph.nodes[c.nodes[1].toLowerCase()];
+    else b = {x: a.x + 60, y: a.y};
+    if(!a||!b) return;
+    const mx = (a.x + b.x)/2, my = (a.y + b.y)/2;
+    const angle = Math.atan2(b.y - a.y, b.x - a.x);
+
+    // component group
+    const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+    g.setAttribute('transform', `translate(${mx},${my}) rotate(${angle*180/Math.PI})`);
+
+    // draw symbol (simplified)
+    const t = (c.type||'').toUpperCase();
+    if(t==='R'){
+      const path = document.createElementNS('http://www.w3.org/2000/svg','path'); path.setAttribute('d','M -40 0 l 10 0 l 6 -10 l 12 20 l 12 -20 l 12 20 l 6 -10 l 10 0'); path.setAttribute('stroke','black'); path.setAttribute('fill','none'); path.setAttribute('stroke-width','2'); g.appendChild(path);
+    } else if(t==='C'){
+      const p1 = document.createElementNS('http://www.w3.org/2000/svg','path'); p1.setAttribute('d','M -20 -12 L -20 12'); p1.setAttribute('stroke','black'); p1.setAttribute('stroke-width','2'); g.appendChild(p1);
+      const p2 = document.createElementNS('http://www.w3.org/2000/svg','path'); p2.setAttribute('d','M 0 -12 L 0 12'); p2.setAttribute('stroke','black'); p2.setAttribute('stroke-width','2'); g.appendChild(p2);
+    } else if(t==='L'){
+      const circ = document.createElementNS('http://www.w3.org/2000/svg','path'); circ.setAttribute('d','M -30 0 q 6 -18 12 0 q 6 -18 12 0 q 6 -18 12 0'); circ.setAttribute('stroke','black'); circ.setAttribute('fill','none'); circ.setAttribute('stroke-width','2'); g.appendChild(circ);
+    } else if(t==='D' || t==='LED'){
+      const p = document.createElementNS('http://www.w3.org/2000/svg','path'); p.setAttribute('d','M -24 -12 L 8 0 L -24 12 Z M 8 -12 L 8 12'); p.setAttribute('stroke','black'); p.setAttribute('fill','none'); p.setAttribute('stroke-width','2'); g.appendChild(p);
+    } else if(t==='V' || t==='I'){
+      const circ = document.createElementNS('http://www.w3.org/2000/svg','circle'); circ.setAttribute('r','16'); circ.setAttribute('stroke','black'); circ.setAttribute('fill','none'); circ.setAttribute('stroke-width','2'); g.appendChild(circ);
+      const lab = document.createElementNS('http://www.w3.org/2000/svg','text'); lab.setAttribute('x','0'); lab.setAttribute('y','6'); lab.setAttribute('text-anchor','middle'); lab.setAttribute('font-size','12'); lab.setAttribute('fill','black'); lab.textContent = t; g.appendChild(lab);
+    } else if(t==='Q' || t==='M'){
+      const rect = document.createElementNS('http://www.w3.org/2000/svg','rect'); rect.setAttribute('x','-20'); rect.setAttribute('y','-14'); rect.setAttribute('width','40'); rect.setAttribute('height','28'); rect.setAttribute('stroke','black'); rect.setAttribute('fill','none'); rect.setAttribute('stroke-width','2'); g.appendChild(rect);
+      const lab = document.createElementNS('http://www.w3.org/2000/svg','text'); lab.setAttribute('x','0'); lab.setAttribute('y','6'); lab.setAttribute('text-anchor','middle'); lab.setAttribute('font-size','10'); lab.setAttribute('fill','black'); lab.textContent = c.value ? c.value : t; g.appendChild(lab);
+    } else if(t==='U'){
+      const p = document.createElementNS('http://www.w3.org/2000/svg','path'); p.setAttribute('d','M -26 -18 L 20 0 L -26 18 Z'); p.setAttribute('stroke','black'); p.setAttribute('fill','none'); p.setAttribute('stroke-width','2'); g.appendChild(p);
+      const lab = document.createElementNS('http://www.w3.org/2000/svg','text'); lab.setAttribute('x','0'); lab.setAttribute('y','6'); lab.setAttribute('text-anchor','middle'); lab.setAttribute('font-size','10'); lab.setAttribute('fill','black'); lab.textContent = c.value || t; g.appendChild(lab);
+    } else if(t==='GND'){
+      const gnd = document.createElementNS('http://www.w3.org/2000/svg','path'); gnd.setAttribute('d','M -6 0 L 6 0 M -4 6 L 4 6 M -2 10 L 2 10'); gnd.setAttribute('stroke','black'); gnd.setAttribute('stroke-width','2'); g.appendChild(gnd);
+    } else {
+      const txt = document.createElementNS('http://www.w3.org/2000/svg','text'); txt.setAttribute('x','0'); txt.setAttribute('y','0'); txt.setAttribute('text-anchor','middle'); txt.setAttribute('font-size','12'); txt.setAttribute('fill','black'); txt.textContent = c.id; g.appendChild(txt);
+    }
+
+    compsGroup.appendChild(g);
+
+    // compute endpoints and draw connector lines for exact joins
+    const endpoints = compEndpoints(mx,my,angle,40);
+    const nodeA = a, nodeB = b;
+    // draw short connector from node center to component endpoint
+    if(nodeA){ const la = document.createElementNS('http://www.w3.org/2000/svg','line'); la.setAttribute('x1',nodeA.x); la.setAttribute('y1',nodeA.y); la.setAttribute('x2',endpoints[0].x); la.setAttribute('y2',endpoints[0].y); la.setAttribute('stroke','black'); la.setAttribute('stroke-width','2'); wiresGroup.appendChild(la); }
+    if(nodeB){ const lb = document.createElementNS('http://www.w3.org/2000/svg','line'); lb.setAttribute('x1',nodeB.x); lb.setAttribute('y1',nodeB.y); lb.setAttribute('x2',endpoints[1].x); lb.setAttribute('y2',endpoints[1].y); lb.setAttribute('stroke','black'); lb.setAttribute('stroke-width','2'); wiresGroup.appendChild(lb); }
+
+  });
+
+  // draw node dots and draggable labels
+  Object.values(graph.nodes).forEach(n=>{
+    const g = document.createElementNS('http://www.w3.org/2000/svg','g'); g.setAttribute('transform',`translate(${n.x},${n.y})`);
+    const dot = document.createElementNS('http://www.w3.org/2000/svg','circle'); dot.setAttribute('r','4'); dot.setAttribute('fill','black'); g.appendChild(dot);
+    const txt = document.createElementNS('http://www.w3.org/2000/svg','text'); txt.setAttribute('x','8'); txt.setAttribute('y','4'); txt.setAttribute('font-size','11'); txt.setAttribute('fill','black'); txt.textContent = n.name; g.appendChild(txt);
+    nodesGroup.appendChild(g);
+    // make label draggable
+    txt.style.cursor='move';
+    txt.addEventListener('mousedown', e=>{ e.stopPropagation(); startNodeDrag(n,e); });
+  });
+
+  // update net list view
+  refreshSideList();
+}
+
+// node label drag
+let nodeDrag = null; function startNodeDrag(node, ev){ nodeDrag = {node, start: screenToWorld(ev.clientX,ev.clientY), origX:node.x, origY:node.y}; window.addEventListener('mousemove',nodeDragMove); window.addEventListener('mouseup', nodeDragEnd); }
+function nodeDragMove(ev){ if(!nodeDrag) return; const p = screenToWorld(ev.clientX,ev.clientY); const dx = p.x - nodeDrag.start.x; const dy = p.y - nodeDrag.start.y; nodeDrag.node.x = snap ? snapTo(nodeDrag.origX + dx) : nodeDrag.origX + dx; nodeDrag.node.y = snap ? snapTo(nodeDrag.origY + dy) : nodeDrag.origY + dy; render(); }
+function nodeDragEnd(){ nodeDrag=null; window.removeEventListener('mousemove',nodeDragMove); window.removeEventListener('mouseup', nodeDragEnd); }
+
+// --- utilities ---
+function refreshSideList(){ const el = document.getElementById('list'); el.innerHTML=''; components.forEach(c=>{ const d = document.createElement('div'); d.style.borderBottom='1px dashed #ccc'; d.style.padding='6px 2px'; d.innerHTML = `<b>${c.id}</b> &nbsp; <span class='muted'>${c.type}</span><br/><small class='muted'>nodes: ${c.nodes.join(', ')}</small>`; el.appendChild(d); }); const nl = document.getElementById('netlistview'); nl.innerHTML=''; Object.values(graph.nodes).forEach(n=>{ const d=document.createElement('div'); d.style.padding='4px 2px'; d.innerHTML = `<b>${n.name}</b> — refs: ${n.refs.length}`; nl.appendChild(d); }); }
+
+// --- high level generate & render ---
+function generate(){ const txt = document.getElementById('netlist').value; parseNetlist(txt); buildGraph(); layoutGraph(300); render(); setStatus('Diagram generated'); }
+
+document.getElementById('gen-netlist').addEventListener('click', ()=>{ try{ generate(); }catch(e){ console.error(e); alert('Error: '+e); } });
+
+// auto layout
+document.getElementById('auto-layout').addEventListener('click', ()=>{ layoutGraph(300); render(); setStatus('Auto-layout applied'); });
+
+// copy netlist
+document.getElementById('copy-net').addEventListener('click', ()=>{ const t = document.getElementById('netlist'); t.select(); document.execCommand('copy'); setStatus('Netlist copied to clipboard'); });
+
+// export svg
+document.getElementById('export-svg').addEventListener('click', ()=>{ const serializer = new XMLSerializer(); const source = serializer.serializeToString(svg); const blob = new Blob([source],{type:'image/svg+xml'}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download='diagram.svg'; a.click(); });
+
+// export png
+document.getElementById('export-png').addEventListener('click', ()=>{
+  const serializer = new XMLSerializer(); const source = serializer.serializeToString(svg);
+  const img = new Image(); const svgBlob = new Blob([source],{type:'image/svg+xml;charset=utf-8'}); const url = URL.createObjectURL(svgBlob);
+  img.onload = function(){ const canvas = document.createElement('canvas'); canvas.width = 1200; canvas.height = 800; const ctx = canvas.getContext('2d'); ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height); ctx.drawImage(img,0,0); URL.revokeObjectURL(url); canvas.toBlob(function(b){ const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download='diagram.png'; a.click(); }); };
+  img.onerror = ()=>{ alert('Export PNG failed'); };
+  img.src = url;
+});
+
+// zoom/pan controls
+function updateViewport(){ viewport.setAttribute('transform', `translate(${panX},${panY}) scale(${scale})`); }
+
+document.getElementById('zoom-in').addEventListener('click', ()=>{ scale *= 1.2; updateViewport(); });
+document.getElementById('zoom-out').addEventListener('click', ()=>{ scale /= 1.2; updateViewport(); });
+document.getElementById('fit-view').addEventListener('click', ()=>{ panX=0; panY=0; scale=1; updateViewport(); });
+document.getElementById('toggle-grid').addEventListener('click', ()=>{ gridOn=!gridOn; drawGrid(); render(); });
+document.getElementById('toggle-snap').addEventListener('click', ()=>{ snap=!snap; setStatus('Snap ' + (snap? 'ON':'OFF')); });
+
+// highlight floating nets
+document.getElementById('highlight-floats').addEventListener('click', ()=>{ overlaysGroup.innerHTML=''; Object.values(graph.nodes).forEach(n=>{ if(n.refs.length<=1){ // floating or single reference
+      const g = document.createElementNS('http://www.w3.org/2000/svg','g'); g.setAttribute('transform',`translate(${n.x},${n.y})`);
+      const c = document.createElementNS('http://www.w3.org/2000/svg','circle'); c.setAttribute('r','8'); c.setAttribute('stroke','red'); c.setAttribute('fill','none'); c.setAttribute('stroke-width','2'); g.appendChild(c);
+      const txt = document.createElementNS('http://www.w3.org/2000/svg','text'); txt.setAttribute('x',10); txt.setAttribute('y',4); txt.setAttribute('font-size','12'); txt.setAttribute('fill','red'); txt.textContent='Floating'; g.appendChild(txt);
+      overlaysGroup.appendChild(g);
+    } }); setStatus('Floating nets highlighted'); });
+
+// --- interactive zoom/pan via mouse ---
+let isPanning=false, panStart={x:0,y:0}, panOrig={x:0,y:0}; svg.addEventListener('mousedown', e=>{ if(e.button===1 || e.altKey){ isPanning=true; panStart={x:e.clientX,y:e.clientY}; panOrig={x:panX,y:panY}; svg.style.cursor='grabbing'; } }); window.addEventListener('mousemove', e=>{ if(isPanning){ panX = panOrig.x + (e.clientX - panStart.x); panY = panOrig.y + (e.clientY - panStart.y); updateViewport(); } }); window.addEventListener('mouseup', e=>{ if(isPanning){ isPanning=false; svg.style.cursor='grab'; } }); svg.addEventListener('wheel', e=>{ e.preventDefault(); const delta = e.deltaY>0?0.9:1.1; const prevScale = scale; scale *= delta; // zoom to cursor
+  const rect = svg.getBoundingClientRect(); const cx = (e.clientX - rect.left); const cy = (e.clientY - rect.top);
+  panX = cx - (cx - panX) * (scale/prevScale);
+  panY = cy - (cy - panY) * (scale/prevScale);
+  updateViewport(); });
+
+// --- initial demo netlist ---
+document.getElementById('netlist').value = `V1 n001 0 DC 5\nR1 n001 n002 1k\nC1 n002 0 10uF\nR2 n002 n003 2k\nL1 n003 0 10uH\nQ1 n003 n002 0 2N3904`;
+// generate at load
+setTimeout(()=>{ try{ document.getElementById('gen-netlist').click(); }catch(e){} }, 200);
+
+</script>
+</body>
+</html>
